@@ -1,1 +1,10 @@
-hi
+Flask
+pandas
+numpy
+yfinance
+requests
+ta-lib
+plotly
+statsmodels
+prophet
+gunicorn
