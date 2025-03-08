@@ -1,4 +1,4 @@
-Flask
+xqFlask
 pandas
 numpy
 yfinance
@@ -8,3 +8,4 @@ plotly
 statsmodels
 prophet
 gunicorn
+app
