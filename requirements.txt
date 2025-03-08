@@ -3,7 +3,7 @@ pandas
 numpy
 yfinance
 requests
-ta-lib
+TA
 plotly
 statsmodels
 prophet
