@@ -14,16 +14,7 @@ from plotly.subplots import make_subplots
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 from prophet import Prophet
 from flask import Flask, request, render_template_string
-from flask import Flask
-
-app = Flask(__name__)  # Ensure this exists
-
-@app.route("/")
-def home():
-    return "Hello, Render!"
-
-if __name__ == "__main__":
-    app.run(debug=True)
+from scipy.signal import argrelextrema  # <-- New import for divergence detection
 
 # Suppress logs/warnings
 logging.getLogger("cmdstanpy").disabled = True
@@ -94,7 +85,7 @@ def get_interval(chart_type: str) -> str:
     return mapping.get(ct, "1d")
 
 
-def fetch_data(ticker: str, start_date: datetime, end_date: datetime, chart_type: str) -> pd.DataFrame:
+def fetch_data(ticker: str, start_date, end_date: datetime, chart_type: str) -> pd.DataFrame:
     interval = get_interval(chart_type)
     df = yf.download(ticker, start=start_date, end=end_date, interval=interval, progress=False)
     if df.empty:
@@ -113,13 +104,55 @@ def fetch_vix_data(start_date: datetime, end_date: datetime) -> pd.Series:
 
 
 # -------------------------------------------------------------------
-# Scoring Functions
+# New Divergence Detection Function
+# -------------------------------------------------------------------
+def detect_divergence(df: pd.DataFrame, window=5) -> (bool, bool):
+    """
+    Detects bullish and bearish divergence between price and RSI.
+
+    Bullish divergence: Price makes a lower low while RSI makes a higher low.
+    Bearish divergence: Price makes a higher high while RSI makes a lower high.
+
+    Args:
+        df (pd.DataFrame): DataFrame containing 'Close' and 'RSI' columns.
+        window (int): Order for local extrema detection.
+
+    Returns:
+        tuple: (bullish_divergence, bearish_divergence)
+    """
+    bullish_div = False
+    bearish_div = False
+
+    # Ensure required columns exist and enough data is available
+    if 'Close' not in df.columns or 'RSI' not in df.columns or len(df) < window * 2:
+        return bullish_div, bearish_div
+
+    # Bullish divergence: look for two recent local minima where the price makes a lower low,
+    # but RSI makes a higher low.
+    price_lows = argrelextrema(df['Close'].values, np.less, order=window)[0]
+    if len(price_lows) >= 2:
+        idx1, idx2 = price_lows[-2], price_lows[-1]
+        if df['Close'].iloc[idx2] < df['Close'].iloc[idx1] and df['RSI'].iloc[idx2] > df['RSI'].iloc[idx1]:
+            bullish_div = True
+
+    # Bearish divergence: look for two recent local maxima where the price makes a higher high,
+    # but RSI makes a lower high.
+    price_highs = argrelextrema(df['Close'].values, np.greater, order=window)[0]
+    if len(price_highs) >= 2:
+        idx1, idx2 = price_highs[-2], price_highs[-1]
+        if df['Close'].iloc[idx2] > df['Close'].iloc[idx1] and df['RSI'].iloc[idx2] < df['RSI'].iloc[idx1]:
+            bearish_div = True
+
+    return bullish_div, bearish_div
+
+
+# -------------------------------------------------------------------
+# Scoring Functions (unchanged)
 # -------------------------------------------------------------------
 def compute_fundamental_score_original(fundamentals: dict) -> float:
     score = 0.0
     mc = safe_float(fundamentals.get("marketCap"), 0)
     score += 15 if mc >= 2e11 else 7.5
-
     trailing_pe = safe_float(fundamentals.get("trailingPE"), None)
     forward_pe = safe_float(fundamentals.get("forwardPE"), None)
     pe_subscore = 0
@@ -128,50 +161,39 @@ def compute_fundamental_score_original(fundamentals: dict) -> float:
     if forward_pe is not None:
         pe_subscore += 10 if forward_pe < 15 else 0 if forward_pe > 30 else 5
     score += min(pe_subscore, 20)
-
     ps = safe_float(fundamentals.get("priceToSalesTrailing12Months"), None)
     if ps is not None:
         score += 5 if ps < 2 else 0 if ps > 10 else 2.5
-
     pb = safe_float(fundamentals.get("priceToBook"), None)
     if pb is not None:
         score += 5 if pb < 1 else 0 if pb > 5 else 2.5
-
     evrev = safe_float(fundamentals.get("enterpriseToRevenue"), None)
     if evrev is not None:
         score += 5 if evrev < 3 else 0 if evrev > 10 else 2.5
-
     evebitda = safe_float(fundamentals.get("enterpriseToEbitda"), None)
     if evebitda is not None:
         score += 5 if evebitda < 10 else 0 if evebitda > 20 else 2.5
-
     pm = safe_float(fundamentals.get("profitMargins"), None)
     if pm is not None:
         pm_percent = pm * 100
         score += 5 if pm_percent > 20 else 0 if pm_percent < 0 else 2.5
-
     roa = safe_float(fundamentals.get("returnOnAssets"), None)
     if roa is not None:
         roa_percent = roa * 100
         score += 5 if roa_percent > 10 else 0 if roa_percent < 2 else 2.5
-
     roe = safe_float(fundamentals.get("returnOnEquity"), None)
     if roe is not None:
         roe_percent = roe * 100
         score += 5 if roe_percent > 15 else 0 if roe_percent < 5 else 2.5
-
     net_inc = safe_float(fundamentals.get("netIncomeToCommon"), None)
     if net_inc is not None:
         score += 5 if net_inc > 0 else 0
-
     cash = safe_float(fundamentals.get("totalCash"), None)
     if cash is not None:
         score += 5 if cash >= 1e9 else 2.5
-
     dte = safe_float(fundamentals.get("debtToEquity"), None)
     if dte is not None:
         score += 10 if dte < 1 else 0 if dte > 2 else 5
-
     return score
 
 
@@ -193,45 +215,37 @@ def compute_technical_score_original(close_px, sma50, sma200, rsi_val, macd_val,
     if close_px is not None and sma50 is not None and sma200 is not None:
         if close_px > sma50 and close_px > sma200:
             score += 20
-
     if rsi_val is not None:
         if rsi_val < 30:
             score += 20
         elif rsi_val < 70:
             score += 10
-
     if macd_val is not None and macd_sig is not None:
         if macd_val > macd_sig:
             score += 20
-
     if close_px is not None and bb_lo is not None and bb_up is not None:
         if close_px < bb_lo:
             score += 10
         elif close_px < bb_up:
             score += 5
-
     if atr_val is not None:
         if atr_val < 5:
             score += 10
         elif atr_val < 10:
             score += 5
-
     if stoch_k is not None:
         if stoch_k < 20:
             score += 10
         elif stoch_k < 80:
             score += 5
-
     if close_px is not None and open_px is not None and close_px > open_px:
         score += 10
-
     return score
 
 
 def compute_fundamental_score_enhanced(fundamentals: dict, industry: str = None) -> float:
     score = 0.0
     weights = {'valuation': 0.4, 'profitability': 0.3, 'financial_health': 0.3}
-
     # Valuation score
     val_score = val_count = 0
     for key, threshold_high, threshold_low in [
@@ -246,7 +260,6 @@ def compute_fundamental_score_enhanced(fundamentals: dict, industry: str = None)
             val_count += 1
     if val_count > 0:
         score += weights['valuation'] * (val_score / val_count) * 5
-
     # Profitability score
     prof_score = prof_count = 0
     pm = safe_float(fundamentals.get("profitMargins"), None)
@@ -270,7 +283,6 @@ def compute_fundamental_score_enhanced(fundamentals: dict, industry: str = None)
         prof_count += 1
     if prof_count > 0:
         score += weights['profitability'] * (prof_score / prof_count) * 5
-
     # Financial health score
     fin_score = fin_count = 0
     cash = safe_float(fundamentals.get("totalCash"), None)
@@ -291,7 +303,6 @@ def compute_fundamental_score_enhanced(fundamentals: dict, industry: str = None)
         fin_count += 1
     if fin_count > 0:
         score += weights['financial_health'] * (fin_score / fin_count) * 5
-
     return min(score, 100)
 
 
@@ -299,7 +310,6 @@ def compute_technical_score_enhanced(close_px, sma50, sma200, rsi_val, macd_val,
                                      stoch_k, open_px, vwap, ichimoku_span_a, ichimoku_span_b, adx_val, vix_val=None):
     score = 0.0
     weights = {'trend': 0.3, 'momentum': 0.3, 'volatility': 0.2, 'price_action': 0.2}
-
     close_px = safe_float(close_px, None)
     sma50 = safe_float(sma50, None)
     sma200 = safe_float(sma200, None)
@@ -316,7 +326,6 @@ def compute_technical_score_enhanced(close_px, sma50, sma200, rsi_val, macd_val,
     ichimoku_span_b = safe_float(ichimoku_span_b, None)
     adx_val = safe_float(adx_val, None)
     vix_val = safe_float(vix_val, None)
-
     # Trend Score
     trend_score = 0
     if close_px is not None and sma50 is not None and close_px > sma50:
@@ -327,7 +336,6 @@ def compute_technical_score_enhanced(close_px, sma50, sma200, rsi_val, macd_val,
             close_px > max(ichimoku_span_a, ichimoku_span_b)):
         trend_score += 20
     score += weights['trend'] * trend_score
-
     # Momentum Score
     mom_score = 0
     if rsi_val is not None:
@@ -345,7 +353,6 @@ def compute_technical_score_enhanced(close_px, sma50, sma200, rsi_val, macd_val,
     if adx_val is not None and adx_val > 25:
         mom_score += 15
     score += weights['momentum'] * mom_score
-
     # Volatility Score
     vol_score = 0
     if close_px is not None and bb_lo is not None and bb_up is not None:
@@ -359,7 +366,6 @@ def compute_technical_score_enhanced(close_px, sma50, sma200, rsi_val, macd_val,
         elif atr_val < 7:
             vol_score += 5
     score += weights['volatility'] * vol_score
-
     # Price Action Score
     pa_score = 0
     if close_px is not None and vwap is not None and close_px > vwap:
@@ -367,19 +373,17 @@ def compute_technical_score_enhanced(close_px, sma50, sma200, rsi_val, macd_val,
     if close_px is not None and open_px is not None and close_px > open_px:
         pa_score += 15
     score += weights['price_action'] * pa_score
-
     # VIX adjustment
     if vix_val is not None:
         if vix_val > 30:
             score *= 0.9
         elif vix_val < 20:
             score *= 1.1
-
     return min(max(score, 0), 100)
 
 
 # -------------------------------------------------------------------
-# Technical Indicator Functions
+# Technical Indicator Functions (unchanged)
 # -------------------------------------------------------------------
 def rsi(series: pd.Series, period=14) -> pd.Series:
     return pd.Series(talib.RSI(series, timeperiod=period), index=series.index)
@@ -432,7 +436,6 @@ def ichimoku_cloud(df: pd.DataFrame):
     low_26 = df['Low'].rolling(window=26).min()
     high_52 = df['High'].rolling(window=52).max()
     low_52 = df['Low'].rolling(window=52).min()
-
     tenkan_sen = (high_9 + low_9) / 2
     kijun_sen = (high_26 + low_26) / 2
     senkou_span_a = ((tenkan_sen + kijun_sen) / 2).shift(26)
@@ -446,7 +449,7 @@ def adx(df: pd.DataFrame, period=14) -> pd.Series:
 
 
 # -------------------------------------------------------------------
-# Pattern Detection and Forecasting
+# Pattern Detection and Forecasting (unchanged except for divergence)
 # -------------------------------------------------------------------
 def detect_rectangle(df: pd.DataFrame, lookback=30, tolerance=0.02) -> bool:
     if len(df) < lookback:
@@ -553,15 +556,11 @@ def add_fibonacci_retracement(fig, df: pd.DataFrame, lookback: int = 100):
         fig.add_hline(y=fib_price, line_width=1, line_dash='dash', line_color='gray', row=1, col=1)
 
 
-# -------------------------------------------------------------------
-# Fundamental Analysis Printing Function
-# -------------------------------------------------------------------
 def print_detailed_fundamentals(ticker: str, fundamentals: dict) -> dict:
     print(f"\n=== Fundamental Analysis ({ticker}) ===")
     signals = {"bullish": False, "bearish": False}
     long_name = fundamentals.get("longName", "N/A")
     print(f"longName: {long_name}")
-
     keys = [
         ("recommendationKey", fundamentals.get("recommendationKey")),
         ("Market Cap", fundamentals.get("marketCap")),
@@ -582,7 +581,6 @@ def print_detailed_fundamentals(ticker: str, fundamentals: dict) -> dict:
         ("Total Debt/Equity (mrq)", fundamentals.get("debtToEquity")),
         ("Levered Free Cash Flow (ttm)", fundamentals.get("freeCashflow"))
     ]
-
     for key, value in keys:
         comment = ""
         if value is not None:
@@ -594,7 +592,6 @@ def print_detailed_fundamentals(ticker: str, fundamentals: dict) -> dict:
                 val_str = format_value(value, scale='%')
             else:
                 val_str = format_value(value)
-
             if key == "recommendationKey":
                 lower_val = str(value).lower()
                 if lower_val in ("buy", "strong_buy"):
@@ -629,7 +626,6 @@ def print_detailed_fundamentals(ticker: str, fundamentals: dict) -> dict:
                         signals["bearish"] = True
                     else:
                         comment = "Neutral"
-
             if comment:
                 print(f"{key}: {val_str} → {comment}")
             else:
@@ -639,15 +635,11 @@ def print_detailed_fundamentals(ticker: str, fundamentals: dict) -> dict:
     return signals
 
 
-# -------------------------------------------------------------------
-# Chart Generation, Analysis, and Flask App
-# -------------------------------------------------------------------
 def generate_chart_html(df: pd.DataFrame, ticker: str, chart_type: str) -> str:
     sr_lookback = 250
     sr_subset = df.tail(sr_lookback)
     support_val = float(sr_subset['Low'].min())
     resistance_val = float(sr_subset['High'].max())
-
     fig = make_subplots(rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.02,
                         row_heights=[0.5, 0.2, 0.2, 0.2])
     fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'],
@@ -655,7 +647,6 @@ def generate_chart_html(df: pd.DataFrame, ticker: str, chart_type: str) -> str:
                                  name='Price', increasing_line_color='#00FF00',
                                  decreasing_line_color='#FF0000'),
                   row=1, col=1)
-
     for col, color, name in [
         ('SMA50', 'cyan', 'SMA50'),
         ('SMA200', 'orange', 'SMA200'),
@@ -666,7 +657,6 @@ def generate_chart_html(df: pd.DataFrame, ticker: str, chart_type: str) -> str:
         fig.add_trace(go.Scatter(x=df.index, y=df[col],
                                  line=dict(color=color, width=1), name=name),
                       row=1, col=1)
-
     fig.add_trace(go.Scatter(x=df.index, y=df['SpanA'], line=dict(color='green', width=1),
                              name='Span A'), row=1, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=df['SpanB'], line=dict(color='red', width=1),
@@ -674,13 +664,11 @@ def generate_chart_html(df: pd.DataFrame, ticker: str, chart_type: str) -> str:
     fig.add_hline(y=support_val, line_dash='dash', line_color="green", annotation_text="Support", row=1, col=1)
     fig.add_hline(y=resistance_val, line_dash='dash', line_color="red", annotation_text="Resistance", row=1, col=1)
     add_fibonacci_retracement(fig, df, lookback=100)
-
     colors_volume = ['green' if c > o else 'red' for c, o in zip(df['Close'], df['Open'])]
     fig.add_trace(go.Bar(x=df.index, y=df['Volume'], name='Volume',
                          marker_color=colors_volume, opacity=0.7),
                   row=2, col=1)
     fig.update_yaxes(title_text="Volume", row=2, col=1)
-
     fig.add_trace(go.Scatter(x=df.index, y=df['RSI'],
                              line=dict(color='cyan', width=2), name='RSI'),
                   row=3, col=1)
@@ -689,7 +677,6 @@ def generate_chart_html(df: pd.DataFrame, ticker: str, chart_type: str) -> str:
     fig.add_hline(y=70, line=dict(color='red', dash='dash'), row=3, col=1)
     fig.add_hline(y=30, line=dict(color='green', dash='dash'), row=3, col=1)
     fig.update_yaxes(title_text="RSI", row=3, col=1)
-
     fig.add_trace(go.Scatter(x=df.index, y=df['MACD'], line=dict(color='white', width=1),
                              name='MACD'), row=4, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=df['MACD_Signal'], line=dict(color='yellow', width=1),
@@ -698,7 +685,6 @@ def generate_chart_html(df: pd.DataFrame, ticker: str, chart_type: str) -> str:
     fig.add_trace(go.Bar(x=df.index, y=df['MACD_Hist'], marker_color=macd_hist_colors,
                          name='MACD_Hist'), row=4, col=1)
     fig.update_yaxes(title_text="MACD", row=4, col=1)
-
     fig.update_layout(
         title=f"{ticker} - {chart_type} Analysis",
         template=None, paper_bgcolor="black", plot_bgcolor="black",
@@ -726,17 +712,11 @@ def run_all_web(ticker, start_date, end_date, chart_type, forecast_days_max, hor
         try:
             # Fetch the full dataset once
             df = run_analysis(ticker, start_date, end_date, chart_type)
-
-            # Create a copy for analytics (full data for detailed analysis)
+            # Create a copy for analytics
             df_analytics = df.copy()
-
-            # Run analytics on the full dataset to compute technical indicators
             analyze_data(df_analytics, ticker, chart_type, start_date, end_date)
-
-            # Create a separate copy for drawing charts from the analytics dataframe (now with computed columns)
+            # Create a copy for drawing charts (last 250 rows)
             df_chart = df_analytics.tail(250).copy()
-
-            # Generate the chart using the drawing data
             chart_html = generate_chart_html(df_chart, ticker, chart_type)
         except ValueError as e:
             print(f"Error: {e}")
@@ -744,9 +724,8 @@ def run_all_web(ticker, start_date, end_date, chart_type, forecast_days_max, hor
     return buf.getvalue(), chart_html
 
 
-def analyze_data(df: pd.DataFrame, ticker: str, chart_type: str, start_date: datetime, end_date: datetime):
+def analyze_data(df: pd.DataFrame, ticker: str, chart_type: str, start_date, end_date: datetime):
     show_quarterly_performance(df, last_n=6)
-
     # Technical Indicators
     df['SMA50'] = df['Close'].rolling(50).mean()
     df['SMA200'] = df['Close'].rolling(200).mean()
@@ -761,12 +740,13 @@ def analyze_data(df: pd.DataFrame, ticker: str, chart_type: str, start_date: dat
     df['VWAP'] = vwap(df)
     df['Tenkan'], df['Kijun'], df['SpanA'], df['SpanB'], df['Chikou'] = ichimoku_cloud(df)
     df['ADX'] = adx(df, 14)
-
+    # Create additional lag features for ML forecasting
+    df['lag_1'] = df['Close'].shift(1)
+    df['lag_2'] = df['Close'].shift(2)
     df.dropna(subset=['Close', 'SMA50', 'SMA200', 'RSI', 'MACD', 'MACD_Signal', 'BB_Mid', 'ATR', '%K', 'EMA20', 'VWAP'],
               inplace=True)
     if df.empty:
         raise ValueError("Not enough data after rolling calculations.")
-
     vix_data = fetch_vix_data(start_date, end_date)
     latest_vix = vix_data.iloc[-1] if not vix_data.empty else None
 
@@ -775,17 +755,35 @@ def analyze_data(df: pd.DataFrame, ticker: str, chart_type: str, start_date: dat
     print(f"\n=== Volume Forecast ({FORECAST_DAYS_MAX} days) ===\n", volume_forecast)
     print(f"\n=== Price Forecast ({FORECAST_DAYS_MAX} days, Prophet Log) ===\n", price_forecast)
 
-    # -------------------------------
-    # ML-Based Forecast for Multiple Horizons
-    # -------------------------------
-    ml_horizons = [30, 90, 180, 365]  # 30 days, 90 days, ~6 months, ~1 year
-    features = ['Close', 'Volume', 'SMA50', 'RSI', 'MACD', 'MACD_Signal', 'BB_Mid', 'ATR', '%K', 'EMA20', 'VWAP']
+    ml_horizons = [30, 90, 180, 365]  # Forecast horizons in days
+    features = ['Close', 'Volume', 'SMA50', 'RSI', 'MACD', 'MACD_Signal', 'BB_Mid', 'ATR', '%K', 'EMA20', 'VWAP',
+                'lag_1', 'lag_2']
+
+    today = datetime.today()
+
     for horizon in ml_horizons:
         print(f"\n=== ML-Based Price Forecast ({horizon} days) ===")
-        df_ml = df.copy()
-        df_ml['Target'] = df_ml['Close'].shift(-horizon)
-        train_df = df_ml.dropna(subset=['Target'])
-        if len(train_df) > 100:
+
+        # Determine training window length based on forecast horizon
+        if horizon <= 90:
+            recent_years = 5
+        else:
+            recent_years = 10
+
+        recent_start = today - relativedelta(years=recent_years)
+        recent_df = df[df.index >= recent_start].copy()
+
+        # Ensure lag features are computed
+        recent_df['lag_1'] = recent_df['Close'].shift(1)
+        recent_df['lag_2'] = recent_df['Close'].shift(2)
+
+        # Create target by shifting the 'Close' by the forecast horizon
+        recent_df['Target'] = recent_df['Close'].shift(-horizon)
+        train_df = recent_df.dropna(subset=['Target'])
+
+        if len(train_df) > 50:  # Lower threshold to 50 if needed
+            from sklearn.pipeline import make_pipeline
+            from sklearn.preprocessing import StandardScaler
             from sklearn.ensemble import RandomForestRegressor
             from sklearn.metrics import mean_absolute_error
 
@@ -793,14 +791,15 @@ def analyze_data(df: pd.DataFrame, ticker: str, chart_type: str, start_date: dat
             train = train_df.iloc[:train_size]
             test = train_df.iloc[train_size:]
 
-            model = RandomForestRegressor(n_estimators=20, random_state=42)
+            model = make_pipeline(StandardScaler(), RandomForestRegressor(n_estimators=50, random_state=42))
             model.fit(train[features], train['Target'])
 
             test_pred = model.predict(test[features])
             mae = mean_absolute_error(test['Target'], test_pred)
             print(f"Mean Absolute Error on test set: {mae:.2f}")
 
-            future_features = df_ml[features].iloc[-1].values.reshape(1, -1)
+            # Use the latest available features from the original (unshifted) df for prediction.
+            future_features = df[features].iloc[-1].values.reshape(1, -1)
             future_pred = model.predict(future_features)[0]
             print(f"Predicted price in {horizon} days: {future_pred:.2f}")
         else:
@@ -819,13 +818,11 @@ def analyze_data(df: pd.DataFrame, ticker: str, chart_type: str, start_date: dat
 
     fundamentals = yf.Ticker(ticker).get_info()
     industry = fundamentals.get('industry', None)
-
     fund_signals = print_detailed_fundamentals(ticker, fundamentals)
     fund_score_original = compute_fundamental_score_original(fundamentals)
     fund_score_enhanced = compute_fundamental_score_enhanced(fundamentals, industry)
     print(f"\nOriginal Fundamental Score (0-100): {format_value(fund_score_original)}")
     print(f"Enhanced Fundamental Score (0-100): {format_value(fund_score_enhanced)}")
-
     latest = df.iloc[-1]
     close_px = latest['Close']
     sma50_val = latest['SMA50']
@@ -844,11 +841,9 @@ def analyze_data(df: pd.DataFrame, ticker: str, chart_type: str, start_date: dat
     span_a_val = latest['SpanA'] if not pd.isna(latest['SpanA']) else None
     span_b_val = latest['SpanB'] if not pd.isna(latest['SpanB']) else None
     adx_val = latest['ADX'] if not pd.isna(latest['ADX']) else None
-
     print(f"\n--- {chart_type} Chart Analysis ({ticker}) ---")
     print(f"Last Bar Date: {df.index[-1]}")
     print(f"Close Price: {format_value(close_px)}")
-
     sma50_comment = "Positive (above SMA50)" if close_px > sma50_val else "Negative (below SMA50)"
     sma200_comment = "Positive (above SMA200)" if close_px > sma200_val else "Negative (below SMA200)"
     ema20_comment = "Positive (above EMA20)" if close_px > ema20_val else "Negative (below EMA20)"
@@ -882,7 +877,6 @@ def analyze_data(df: pd.DataFrame, ticker: str, chart_type: str, start_date: dat
         elif close_px < min(span_a_val, span_b_val):
             ichimoku_comment = "Negative (below cloud)"
     adx_comment = "Positive (ADX > 25 => Strong trend)" if adx_val > 25 else "Neutral"
-
     print(f"SMA50 = {format_value(sma50_val)} → {sma50_comment}")
     print(f"SMA200 = {format_value(sma200_val)} → {sma200_comment}")
     print(f"EMA20 = {format_value(ema20_val)} → {ema20_comment}")
@@ -896,7 +890,6 @@ def analyze_data(df: pd.DataFrame, ticker: str, chart_type: str, start_date: dat
     print(
         f"Ichimoku SpanA = {format_value(span_a_val) if span_a_val else 'N/A'}, SpanB = {format_value(span_b_val) if span_b_val else 'N/A'} → {ichimoku_comment}")
     print(f"ADX = {format_value(adx_val) if adx_val else 'N/A'} → {adx_comment}")
-
     sr_lookback = 100
     sr_subset = df.tail(sr_lookback)
     support_val = float(sr_subset['Low'].min())
@@ -904,7 +897,6 @@ def analyze_data(df: pd.DataFrame, ticker: str, chart_type: str, start_date: dat
     print(f"\nSupport/Resistance (last {sr_lookback} bars):")
     print(f"  Nearest support ~{format_value(support_val)}")
     print(f"  Nearest resistance ~{format_value(resistance_val)}")
-
     above_sma = close_px > sma50_val and close_px > sma200_val
     macd_bullish = macd_val > macd_sig
     rsi_normal = rsi_val < 70
@@ -916,6 +908,7 @@ def analyze_data(df: pd.DataFrame, ticker: str, chart_type: str, start_date: dat
     else "Mixed Signals")
     print(f"\nOverall Technical Outlook: {tech_outlook}")
 
+    # Detect additional patterns
     patterns_found = []
     if detect_rectangle(df, 30, 0.02):
         patterns_found.append("Rectangle")
@@ -926,10 +919,16 @@ def analyze_data(df: pd.DataFrame, ticker: str, chart_type: str, start_date: dat
         patterns_found.append("Double Bottom")
     if detect_breakaway_gap(df, 1.02):
         patterns_found.append("Breakaway Gap")
+    # <-- New divergence detection (using RSI divergence)
+    bullish_div, bearish_div = detect_divergence(df, window=5)
+    if bullish_div:
+        patterns_found.append("Bullish Divergence")
+    if bearish_div:
+        patterns_found.append("Bearish Divergence")
+
     print("\nDetected Pattern(s):" if patterns_found else "\nNo major pattern detected.")
     for pat in patterns_found:
         print(" -", pat)
-
     tech_score_original = compute_technical_score_original(
         close_px, sma50_val, sma200_val, rsi_val, macd_val, macd_sig, bb_up, bb_lo, atr_val, k_val, latest['Open']
     )
@@ -939,10 +938,8 @@ def analyze_data(df: pd.DataFrame, ticker: str, chart_type: str, start_date: dat
     )
     print(f"\nOriginal Technical Score (0-100): {format_value(tech_score_original)}")
     print(f"Enhanced Technical Score (0-100): {format_value(tech_score_enhanced)}")
-
     summary_final = build_final_summary(fund_signals, tech_outlook)
     print(f"\n{summary_final}")
-
     if len(df) >= 100:
         fib_sub = df.tail(100)
         swing_high = fib_sub['High'].max()
@@ -962,7 +959,7 @@ def analyze_data(df: pd.DataFrame, ticker: str, chart_type: str, start_date: dat
 
 
 # -------------------------------------------------------------------
-# Flask App
+# Flask App with Updated Data Range for Daily Chart (all available data)
 # -------------------------------------------------------------------
 app = Flask(__name__)
 template = """
@@ -987,7 +984,7 @@ template = """
     <h1>Stock Analysis</h1>
     <form method="post">
         <div class="form-row">
-            <label for="ticker">Enter Ticker Symbol (e.g., TSLA, AAPL, RELIANCE.BO & DMART.NS):</label>
+            <label for="ticker">Enter Ticker Symbol (e.g., TSLA, AAPL, NVDA):</label>
             <input type="text" id="ticker" name="ticker" value="{{ ticker|default('TSLA') }}">
         </div>
         <div class="form-row">
@@ -1024,12 +1021,17 @@ def index():
     if request.method == "POST":
         ticker = request.form.get("ticker", "TSLA").upper()
         chart_type = request.form.get("chart_type", "1D").upper()
-        months_back = {'1H': 18, '4H': 30, '1D': 60, '1W': 180, '1M': 300}.get(chart_type, 60)
+        # For daily charts, use all available historical data
+        if chart_type == "1D":
+            START_DATE = datetime(1900, 1, 1)
+        else:
+            months_back = {'1H': 18, '4H': 30, '1D': 60, '1W': 250, '1M': 300}.get(chart_type, 60)
+            END_DATE = datetime.today()
+            START_DATE = END_DATE - relativedelta(months=months_back)
         END_DATE = datetime.today()
-        START_DATE = END_DATE - relativedelta(months=months_back)
         analysis, chart = run_all_web(ticker, START_DATE, END_DATE, chart_type, FORECAST_DAYS_MAX, HORIZONS)
     return render_template_string(template, analysis=analysis, chart=chart, ticker=ticker, chart_type=chart_type)
 
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5005)
+    app.run(debug=True, port=5015)
