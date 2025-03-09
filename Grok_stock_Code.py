@@ -14,6 +14,16 @@ from plotly.subplots import make_subplots
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 from prophet import Prophet
 from flask import Flask, request, render_template_string
+from flask import Flask
+
+app = Flask(__name__)  # Ensure this exists
+
+@app.route("/")
+def home():
+    return "Hello, Render!"
+
+if __name__ == "__main__":
+    app.run(debug=True)
 
 # Suppress logs/warnings
 logging.getLogger("cmdstanpy").disabled = True
